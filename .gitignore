@@ -1,0 +1,22 @@
+# Build output
+[Bb]in/
+[Oo]bj/
+[Pp]ublish/
+
+# Visual Studio and VS Code user state
+.vs/
+.vscode/
+*.user
+*.suo
+*.userprefs
+
+# Test and coverage output
+TestResults/
+coverage/
+*.trx
+
+# IDE and OS-generated files
+*.code-workspace
+.DS_Store
+Thumbs.db
+

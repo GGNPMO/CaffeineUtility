@@ -1,130 +1,95 @@
-using System.Collections.Frozen;
+using System.Runtime.InteropServices;
 
-namespace Caffeine;
+namespace CaffeineUtility;
 
-/// <summary>Kinds of caffeinated drinks the utility knows about.</summary>
-public enum CaffeineType
+/// <summary>
+/// A deliberately small Windows keep-awake utility.
+///
+/// Windows maintains the requested execution state for the current process, so
+/// this application does not need a timer, simulated mouse movement, or a
+/// background polling loop.
+/// </summary>
+internal static class Program
 {
-    Espresso,
-    BrewedCoffee,
-    ColdBrew,
-    InstantCoffee,
-    DecafCoffee,
-    BlackTea,
-    GreenTea,
-    Matcha,
-    EnergyDrink,
-    Cola
-}
+    private const uint ExecutionStateContinuous = 0x80000000;
+    private const uint ExecutionStateSystemRequired = 0x00000001;
 
-/// <summary>Static metadata for a caffeine type. Values are approximate averages.</summary>
-public sealed record CaffeineInfo(
-    CaffeineType Type,
-    string DisplayName,
-    double MgPer100Ml,
-    int DefaultServingMl,
-    params string[] Aliases);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint SetThreadExecutionState(uint executionState);
 
-/// <summary>Result of checking intake against a daily limit.</summary>
-public readonly record struct IntakeStatus(double TotalMg, double LimitMg)
-{
-    public double RemainingMg => Math.Max(0, LimitMg - TotalMg);
-    public bool IsOverLimit => TotalMg > LimitMg;
-}
-
-public static class CaffeineTypeUtility
-{
-    /// <summary>Commonly cited safe daily limit for healthy adults (mg).</summary>
-    public const double DefaultDailyLimitMg = 400;
-
-    /// <summary>Approximate caffeine half-life in healthy adults (hours).</summary>
-    public const double DefaultHalfLifeHours = 5;
-
-    private static readonly FrozenDictionary<CaffeineType, CaffeineInfo> Registry =
-        new CaffeineInfo[]
-        {
-            new(CaffeineType.Espresso,      "Espresso",       212, 30,  "shot", "espresso shot"),
-            new(CaffeineType.BrewedCoffee,  "Brewed Coffee",   40, 240, "coffee", "drip", "filter coffee"),
-            new(CaffeineType.ColdBrew,      "Cold Brew",       50, 355, "cold brew", "coldbrew"),
-            new(CaffeineType.InstantCoffee, "Instant Coffee",  30, 240, "instant", "nescafe"),
-            new(CaffeineType.DecafCoffee,   "Decaf Coffee",     2, 240, "decaf"),
-            new(CaffeineType.BlackTea,      "Black Tea",       20, 240, "tea", "chai", "black tea"),
-            new(CaffeineType.GreenTea,      "Green Tea",       12, 240, "green tea"),
-            new(CaffeineType.Matcha,        "Matcha",          30, 240, "matcha"),
-            new(CaffeineType.EnergyDrink,   "Energy Drink",    32, 250, "energy", "energy drink", "redbull"),
-            new(CaffeineType.Cola,          "Cola",            10, 330, "cola", "soda", "coke"),
-        }.ToFrozenDictionary(i => i.Type);
-
-    private static readonly FrozenDictionary<string, CaffeineType> AliasMap = BuildAliasMap();
-
-    private static FrozenDictionary<string, CaffeineType> BuildAliasMap()
+    private static int Main()
     {
-        var map = new Dictionary<string, CaffeineType>(StringComparer.OrdinalIgnoreCase);
-        foreach (var info in Registry.Values)
+        Console.Title = "Caffeine - Keep Awake";
+
+        if (!OperatingSystem.IsWindows())
         {
-            map[Normalize(info.Type.ToString())] = info.Type;
-            map[Normalize(info.DisplayName)] = info.Type;
-            foreach (var alias in info.Aliases)
-                map[Normalize(alias)] = info.Type;
+            Console.Error.WriteLine("Caffeine is supported on Windows only.");
+            return 1;
         }
-        return map.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase);
+
+        if (!KeepSystemAwake())
+        {
+            var error = Marshal.GetLastWin32Error();
+            Console.Error.WriteLine($"Could not enable keep-awake mode (Windows error {error}).");
+            return 1;
+        }
+
+        Console.CancelKeyPress += OnCancelKeyPress;
+
+        try
+        {
+            RenderStatus();
+            Console.ReadLine();
+        }
+        finally
+        {
+            StopKeepingSystemAwake();
+            Console.CancelKeyPress -= OnCancelKeyPress;
+        }
+
+        return 0;
     }
 
-    private static string Normalize(string s) =>
-        new(s.Where(char.IsLetterOrDigit).ToArray());
+    private static bool KeepSystemAwake() =>
+        SetThreadExecutionState(ExecutionStateContinuous | ExecutionStateSystemRequired) != 0;
 
-    // ---------- Lookup ----------
-
-    public static CaffeineInfo GetInfo(this CaffeineType type) =>
-        Registry.TryGetValue(type, out var info)
-            ? info
-            : throw new ArgumentOutOfRangeException(nameof(type), type, "Unknown caffeine type.");
-
-    public static IReadOnlyCollection<CaffeineInfo> All() => Registry.Values;
-
-    public static string GetDisplayName(this CaffeineType type) => type.GetInfo().DisplayName;
-
-    // ---------- Parsing ----------
-
-    /// <summary>Parses names, display names and aliases ("Cold Brew", "chai", "shot").</summary>
-    public static bool TryParse(string? text, out CaffeineType type)
+    private static void StopKeepingSystemAwake()
     {
-        type = default;
-        return !string.IsNullOrWhiteSpace(text) && AliasMap.TryGetValue(Normalize(text), out type);
+        // ES_CONTINUOUS without ES_SYSTEM_REQUIRED releases our request and
+        // lets Windows return to the user's normal power-plan behavior.
+        SetThreadExecutionState(ExecutionStateContinuous);
     }
 
-    public static CaffeineType Parse(string text) =>
-        TryParse(text, out var t)
-            ? t
-            : throw new FormatException($"'{text}' is not a recognised caffeine type.");
-
-    // ---------- Calculations ----------
-
-    /// <summary>Caffeine (mg) for an explicit volume in millilitres.</summary>
-    public static double GetCaffeineMg(this CaffeineType type, double volumeMl)
+    private static void RenderStatus()
     {
-        if (volumeMl < 0) throw new ArgumentOutOfRangeException(nameof(volumeMl));
-        return type.GetInfo().MgPer100Ml * volumeMl / 100.0;
+        var interactiveConsole = !Console.IsOutputRedirected;
+        if (interactiveConsole)
+            Console.Clear();
+
+        if (interactiveConsole)
+            Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine("  CAFFEINE");
+        if (interactiveConsole)
+            Console.ResetColor();
+        Console.WriteLine("  Keep your Windows system awake");
+        Console.WriteLine();
+        if (interactiveConsole)
+            Console.ForegroundColor = ConsoleColor.Green;
+        Console.WriteLine("  [ACTIVE]");
+        if (interactiveConsole)
+            Console.ResetColor();
+        Console.WriteLine();
+        Console.WriteLine("  Sleep prevention  System idle sleep blocked");
+        Console.WriteLine("  Display           Unchanged (your power plan applies)");
+        Console.WriteLine("  Resource use      No timer or simulated input");
+        Console.WriteLine();
+        Console.WriteLine("  Press Enter or Ctrl+C to stop.");
     }
 
-    /// <summary>Caffeine (mg) for the default serving size.</summary>
-    public static double GetCaffeineMgPerServing(this CaffeineType type) =>
-        type.GetCaffeineMg(type.GetInfo().DefaultServingMl);
-
-    /// <summary>Total caffeine across servings, e.g. [(Espresso, 2), (Cola, 1)].</summary>
-    public static double TotalMg(IEnumerable<(CaffeineType Type, int Servings)> intake) =>
-        intake.Sum(i => i.Type.GetCaffeineMgPerServing() * i.Servings);
-
-    public static IntakeStatus CheckIntake(
-        IEnumerable<(CaffeineType Type, int Servings)> intake,
-        double dailyLimitMg = DefaultDailyLimitMg) =>
-        new(TotalMg(intake), dailyLimitMg);
-
-    /// <summary>Caffeine still in the body after the given hours (first-order decay).</summary>
-    public static double RemainingAfter(
-        double doseMg, double hoursElapsed, double halfLifeHours = DefaultHalfLifeHours)
+    private static void OnCancelKeyPress(object? sender, ConsoleCancelEventArgs e)
     {
-        if (halfLifeHours <= 0) throw new ArgumentOutOfRangeException(nameof(halfLifeHours));
-        return doseMg * Math.Pow(0.5, hoursElapsed / halfLifeHours);
+        // Restore the power policy before allowing the process to terminate.
+        StopKeepingSystemAwake();
+        e.Cancel = false;
     }
 }
